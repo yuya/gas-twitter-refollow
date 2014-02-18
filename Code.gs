@@ -19,8 +19,12 @@ var SCRIPT_ID = (function () {
         "FOLLOWING" : API_BASE + "/1.1/friends/list"       + API_EXT,
         "FOLLOWERS" : API_BASE + "/1.1/followers/list"     + API_EXT
     },
-    followList = [],
-    followersCount, userProps;
+    screenName     = "***",
+    consumerKey    = "***",
+    consumerSecret = "***",
+    followList     = [],
+    followersList  = [],
+    dailyFollowLimit, nextCursor, userProps;
 
 function each(collection, iterator) {
     var i = 0,
@@ -61,7 +65,7 @@ function getProp(key) {
     return ret;
 }
 
-function setProps(params) {
+function setProp(key, value) {
     if (!params) {
         return;
     }
@@ -73,10 +77,7 @@ function setProps(params) {
                     ;
     }
 
-    each(params, function (key, value) {
-        userProps[key] = value;
-    });
-
+    userProps[key] = value;
     UserProperties.setProperty(SCRIPT_ID, JSON.stringify(userProps));
 }
 
@@ -89,36 +90,143 @@ function oAuthConfig() {
 
     oAuthConfig.setConsumerKey(consumerKey);
     oAuthConfig.setConsumerSecret(consumerSecret);
-
 }
 
-function getFollowers() {
+function getFollowersCount() {
+    var params, options, result;
+
     oAuthConfig();
 
-    var options = {
+    params  = { "screen_name" : screenName };
+    options = {
         oAuthServiceName : "twitter",
         oAuthUseToken    : "always",
         method           : "GET"
-    },
-    response = UrlFetchApp.fetch(API_PATH.FOLLOWERS, options),
-    result;
+    };
+
+    url      = gerUrlWithParams(API_PATH.PROFILE, params);
+    response = UrlFetchApp.fetch(url, options);
 
     if (response.getResponseCode() === 200) {
         result = JSON.parse(response.getContentText());
 
-        extractNoFollowList(result.users);
+        return result.followers_count;
     }
     else {
         throw "error: response code=" + response.getResponseCode();
     }
 }
 
-function extractNoFollowList(users) {
-    var data, db, record;
+function getFollowLimit(followersCount) {
+    if (!followersCount) {
+        return;
+    }
 
+    if (followersCount <= 99) {
+        followLimit =  7;
+    }
+    else if (   99 < followersCount && followersCount <=  1000) {
+        followLimit = 24;
+    }
+    else if ( 1000 < followersCount && followersCount <= 10000) {
+        followLimit = 39;
+    }
+    else if (10000 < followersCount) {
+        followLimit = 77;
+    }
+
+    return followLimit;
+}
+
+function gerUrlWithParams(url, params) {
+    if (!url || !params) {
+        return;
+    }
+
+    var ret = [];
+
+    each(params, function (key, value) {
+        ret.push(key + "=" + encodeURIComponent(value));
+    });
+
+    return url + "?" + ret.join("&");
+}
+
+function getFollowers(cursor) {
+    var params, options, url, response, result;
+
+    oAuthConfig();
+
+    params  = { "count" : 200 };
+    options = {
+        oAuthServiceName : "twitter",
+        oAuthUseToken    : "always",
+        method           : "GET"
+    };
+
+    if (cursor) {
+        params["cursor"] = cursor;
+    }
+
+    url      = gerUrlWithParams(API_PATH.FOLLOWERS, params);
+    response = UrlFetchApp.fetch(url, options);
+
+    if (response.getResponseCode() === 200) {
+        result     = JSON.parse(response.getContentText());
+        nextCursor = result.next_cursor;
+
+        followersList.push(result.users);
+
+        if (!nextCursor) {
+            extractNotFollowingList(followersList);
+        }
+        else {
+            getFollowers(nextCursor);
+        }
+    }
+    else {
+        throw "error: response code=" + response.getResponseCode();
+    }
+}
+
+function validateNGWords(data) {
+    var ret = true,
+        accountRe, textRe, regexp;
+
+    if (!data) {
+        return;
+    }
+
+    accountRe = /_bot$/i;
+    textRe    = /BOT|ＢＯＴ|ｂｏｔ|ボット|ﾎﾞｯﾄ/ig;
+
+    each(data, function (key, value) {
+        switch (key) {
+        case "id":
+        case "screen_name":
+            regexp = accountRe;
+            break;
+        case "name":
+        case "description":
+            regexp = textRe;
+            break;
+        }
+
+        if (regexp.test(value)) {
+            ret = false;
+        }
+    });
+
+    return ret;
+}
+
+function extractNotFollowingList(users) {
     if (!users) {
         return;
     }
+
+    var db = ScriptDb.getMyDb(),
+        data, record;
 
     each(users, function (user) {
         if (!user.following) {
@@ -129,23 +237,106 @@ function extractNoFollowList(users) {
                 "description" : user.description
             };
 
-            followList.push(data);
+            if (validateNGWords(data)) {
+                followList.push(data);
+            }
         }
     });
 
-    db     = ScriptDb.getMyDb();
     record = db.save({
         "latest_run"  : Date.now(),
         "follow_list" : followList
     });
 
-    UserProperties.setProperty("db_id", record.getId());
+    setProp("db_id", record.getId());
 }
 
-function readDataFromDB() {
-    var id = UserProperties.getProperty("db_id"),
-        db = ScriptDb.getMyDb();
+function followUserById(id) {
+    var params, options, url, response, result;
 
-    Logger.log(db.load(id));
+    if (!id) {
+        return;
+    }
+
+    oAuthConfig();
+
+    params  = { "user_id" : id };
+    options = {
+        oAuthServiceName : "twitter",
+        oAuthUseToken    : "always",
+        method           : "POST"
+    };
+
+    url      = gerUrlWithParams(API_PATH.FOLLOW, params);
+    response = UrlFetchApp.fetch(url, options);
+
+    if (response.getResponseCode() === 200) {
+        result = JSON.parse(response.getContentText());
+
+        return result.following ? true : false;
+    }
+    else {
+        throw "error: response code=" + response.getResponseCode();
+    }
+}
+
+function doFollowFromList() {
+    var db = ScriptDb.getMyDb(),
+        followList, targetUserId, randSecond;
+
+    if (!db) {
+        return;
+    }
+
+    followList   = db.load(getProp("db_id"))["follow_list"];
+    targetUserId = followList.pop();
+    randSecond   = 1000 * 60 * (Math.floor(Math.random () * 60) + 1);
+
+    // 手作業感を更に演出してる風
+    Utilities.sleep(randSecond);
+    followUserById(targetUserId);
+}
+
+function resetFollowTimer() {
+    var followersCount = getFollowersCount(),
+        followLimit    = getFollowLimit(followersCount),
+        triggers       = ScriptApp.getProjectTriggers(),
+        triggerName    = "doFollowFromList",
+        timeTrigger    = ScriptApp.newTrigger(triggerName).timeBased(),
+        oneday         = 1000 * 60 * 60 * 24,
+        interval       = Math.round(oneday / (1000 * 60 * 60 * followLimit));
+
+    each(triggers, function (trigger) {
+        if (trigger.getHandlerFunction() === triggerName) {
+            ScriptApp.deleteTrigger(trigger);
+        }
+    });
+
+    createFollowTimer(interval);
+}
+
+function createFollowTimer(interval, timeAmount) {
+    if (!interval) {
+        return;
+    }
+
+    var triggerName = "doFollowFromList",
+        timeTrigger = ScriptApp.newTrigger(triggerName).timeBased();
+
+    return timeTrigger.after(interval).create();
+}
+
+function initInterval() {
+    var triggers    = ScriptApp.getProjectTriggers(),
+        triggerName = "resetFollowTimer",
+        timeTrigger = ScriptApp.newTrigger(triggerName).timeBased();
+
+    each(triggers, function (trigger) {
+        if (trigger.getHandlerFunction() === triggerName) {
+            ScriptApp.deleteTrigger(trigger);
+        }
+    });
+
+    timeTrigger.everyDays(1).create();
 }
 
